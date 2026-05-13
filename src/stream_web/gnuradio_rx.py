@@ -45,6 +45,12 @@ def _soapy_driver_args() -> str:
             args += f",serial={serial}"
         return args
 
+    if sdr_type == "signalhound":
+        args = "driver=SignalHoundVSG60"
+        if config.SIGNALHOUND_SERIAL:
+            args += f",serial={config.SIGNALHOUND_SERIAL}"
+        return args
+
     # PlutoSDR / PlutoPlus (default) — both use the same SoapyPlutoSDR driver
     uri = config.PLUTO_URI
     if uri.startswith("ip:"):

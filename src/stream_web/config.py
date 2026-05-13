@@ -56,11 +56,25 @@ from hubble_satnet_decoder.constants import (  # noqa: F401 — re-exported
 )
 
 # -- SDR selection (override with environment variables) --------------------
-# "pluto" (ADALM-PLUTO & PlutoPlus) or "bladerf"
+# "pluto" (ADALM-PLUTO & PlutoPlus) | "bladerf" | "signalhound" (Signal Hound VSG60A TX via Soapy SignalHoundVSG60)
 SDR_TYPE = os.environ.get("SDR_TYPE", "pluto").lower()
+
+# -- Run mode: "full" (RX + decode + web) | "tx_only" (Flask + TX API only; no RX/processor)
+SDR_MODE = os.environ.get("SDR_MODE", "full").lower()
+
+# VSG60 is TX-only; running the RX pipeline is never valid for this backend.
+if SDR_TYPE == "signalhound":
+    SDR_MODE = "tx_only"
 
 # -- PlutoSDR connection (ignored when SDR_TYPE != "pluto") -----------------
 PLUTO_URI = os.environ.get("PLUTO_URI", "ip:192.168.2.1")
+
+# -- Signal Hound VSG60 (Soapy driver=SignalHoundVSG60), ignored unless SDR_TYPE == "signalhound"
+SIGNALHOUND_SERIAL = os.environ.get("SIGNALHOUND_SERIAL", "").strip()
+
+# TX output level mapping for Signal Hound (dBm; Soapy RF gain), used when SDR_TYPE == "signalhound"
+SIGNALHOUND_TX_DBM_MIN = float(os.environ.get("SIGNALHOUND_TX_DBM_MIN", "-120"))
+SIGNALHOUND_TX_DBM_MAX = float(os.environ.get("SIGNALHOUND_TX_DBM_MAX", "10"))
 
 # -- Radio parameters (shared across SDR backends) -------------------------
 CENTER_FREQ_HZ = 2_482_440_375
@@ -74,6 +88,8 @@ RX_GAIN_STEP_DB = 2
 
 if SDR_TYPE == "bladerf":
     RX_GAIN_MAX_DB = 60
+elif SDR_TYPE == "signalhound":
+    RX_GAIN_MAX_DB = 71  # unused in tx_only / no RX
 else:
     RX_GAIN_MAX_DB = 71
 

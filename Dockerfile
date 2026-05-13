@@ -49,6 +49,23 @@ RUN git clone --depth 1 https://github.com/pothosware/SoapyBladeRF.git /tmp/Soap
     rm -rf /tmp/SoapyBladeRF && \
     ldconfig
 
+# Signal Hound VSG60A (Soapy driver SignalHoundVSG60) — repo bundles libvsg_api + headers
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y libusb-1.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+# Install bundled libvsg_api into ld path with SONAME libvsg_api.so.1 (required at runtime by libSignalHoundVSG60.so)
+RUN git clone --depth 1 https://github.com/SignalHound/soapy-vsg.git /tmp/soapy-vsg && \
+    VSG_SRC=$(ls /tmp/soapy-vsg/lib/libvsg_api.so.* | head -n1) && \
+    cp -a "$VSG_SRC" /usr/local/lib/ && \
+    VSG_BASE=$(basename "$VSG_SRC") && \
+    ln -sf "$VSG_BASE" /usr/local/lib/libvsg_api.so.1 && \
+    ln -sf libvsg_api.so.1 /usr/local/lib/libvsg_api.so && \
+    cd /tmp/soapy-vsg/lib && ln -sf "$VSG_BASE" libvsg_api.so && \
+    cd /tmp/soapy-vsg && mkdir build && cd build && \
+    cmake .. && make -j"$(nproc)" && make install && \
+    rm -rf /tmp/soapy-vsg && \
+    ldconfig
+
 # Pre-download bladeRF FPGA image so the entrypoint can load it at runtime
 RUN mkdir -p /opt/bladerf && \
     wget -q https://www.nuand.com/fpga/hostedxA4-latest.rbf \

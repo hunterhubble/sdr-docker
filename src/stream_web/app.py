@@ -208,6 +208,8 @@ class SharedState:
 
 state = SharedState()
 tx_fg: "TXFlowgraph | None" = None
+# GNU Radio top_block is not thread-safe; Flask serves /api/tx/* concurrently.
+tx_api_lock = threading.Lock()
 
 
 # ===========================================================================
@@ -309,6 +311,8 @@ def api_status():
             chipset_stats=cs_stats,
             known_chipsets=sorted(config.SYNTH_RES.keys()),
             lo_freq_hz=state.lo_freq_hz,
+            sdr_mode=config.SDR_MODE,
+            sdr_type=config.SDR_TYPE,
         )
 
 
@@ -451,83 +455,88 @@ def _get_tx() -> TXFlowgraph:
 
 @app.route("/api/tx/start", methods=["POST"])
 def api_tx_start():
-    data = flask_request.get_json(silent=True) or {}
-    mode = data.get("mode", "tone")
-    print(f"[TX] /api/tx/start called: mode={mode}, data={data}", flush=True)
-    print("[TX] Getting TX flowgraph...", flush=True)
-    fg = _get_tx()
-    print(f"[TX] Flowgraph ready (running={fg.is_running}, mode={fg.mode})", flush=True)
-    try:
-        if mode == "tone":
-            print("[TX] Switching to tone mode...", flush=True)
-            fg.tone_mode()
-            print("[TX] Tone mode set.", flush=True)
-        elif mode == "packet":
-            file_name = data.get("file", "")
-            repeat = data.get("repeat", True)
-            if not file_name:
-                return jsonify(error="file is required for packet mode"), 400
-            file_path = os.path.join(TX_SOURCE_DIR, file_name)
-            print(f"[TX] Switching to packet mode: {file_path} "
-                  f"(exists={os.path.isfile(file_path)}, "
-                  f"size={os.path.getsize(file_path) if os.path.isfile(file_path) else 'N/A'}), "
-                  f"repeat={repeat}", flush=True)
-            fg.packet_mode(file_path, repeat=repeat)
-            print("[TX] Packet mode set.", flush=True)
-        else:
-            return jsonify(error=f"Unknown mode: {mode}"), 400
-        if not fg.is_running:
-            print("[TX] Starting flowgraph...", flush=True)
-            fg.start()
-            print("[TX] Flowgraph started.", flush=True)
-        else:
-            print("[TX] Flowgraph already running.", flush=True)
-        return jsonify(fg.status_dict())
-    except Exception as e:
-        print(f"[TX] ERROR: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return jsonify(error=str(e)), 500
+    with tx_api_lock:
+        data = flask_request.get_json(silent=True) or {}
+        mode = data.get("mode", "tone")
+        print(f"[TX] /api/tx/start called: mode={mode}, data={data}", flush=True)
+        print("[TX] Getting TX flowgraph...", flush=True)
+        fg = _get_tx()
+        print(f"[TX] Flowgraph ready (running={fg.is_running}, mode={fg.mode})", flush=True)
+        try:
+            if mode == "tone":
+                print("[TX] Switching to tone mode...", flush=True)
+                fg.tone_mode()
+                print("[TX] Tone mode set.", flush=True)
+            elif mode == "packet":
+                file_name = data.get("file", "")
+                repeat = data.get("repeat", True)
+                if not file_name:
+                    return jsonify(error="file is required for packet mode"), 400
+                file_path = os.path.join(TX_SOURCE_DIR, file_name)
+                print(f"[TX] Switching to packet mode: {file_path} "
+                      f"(exists={os.path.isfile(file_path)}, "
+                      f"size={os.path.getsize(file_path) if os.path.isfile(file_path) else 'N/A'}), "
+                      f"repeat={repeat}", flush=True)
+                fg.packet_mode(file_path, repeat=repeat)
+                print("[TX] Packet mode set.", flush=True)
+            else:
+                return jsonify(error=f"Unknown mode: {mode}"), 400
+            if not fg.is_running:
+                print("[TX] Starting flowgraph...", flush=True)
+                fg.start()
+                print("[TX] Flowgraph started.", flush=True)
+            else:
+                print("[TX] Flowgraph already running.", flush=True)
+            return jsonify(fg.status_dict())
+        except Exception as e:
+            print(f"[TX] ERROR: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return jsonify(error=str(e)), 500
 
 
 @app.route("/api/tx/stop", methods=["POST"])
 def api_tx_stop():
-    print(f"[TX] /api/tx/stop called (fg={tx_fg is not None}, "
-          f"running={tx_fg.is_running if tx_fg else False})", flush=True)
-    if tx_fg is None or not tx_fg.is_running:
+    with tx_api_lock:
+        print(f"[TX] /api/tx/stop called (fg={tx_fg is not None}, "
+              f"running={tx_fg.is_running if tx_fg else False})", flush=True)
+        if tx_fg is None or not tx_fg.is_running:
+            return jsonify(running=False)
+        tx_fg.stop()
+        print("[TX] Flowgraph stopped.", flush=True)
         return jsonify(running=False)
-    tx_fg.stop()
-    print("[TX] Flowgraph stopped.", flush=True)
-    return jsonify(running=False)
 
 
 @app.route("/api/tx/freq", methods=["GET", "POST"])
 def api_tx_freq():
-    fg = _get_tx()
-    if flask_request.method == "POST":
-        data = flask_request.get_json(silent=True) or {}
-        freq = int(data.get("freq_hz", fg.freq_hz))
-        fg.set_frequency(freq)
+    with tx_api_lock:
+        fg = _get_tx()
+        if flask_request.method == "POST":
+            data = flask_request.get_json(silent=True) or {}
+            freq = int(data.get("freq_hz", fg.freq_hz))
+            fg.set_frequency(freq)
+            return jsonify(freq_hz=fg.freq_hz)
         return jsonify(freq_hz=fg.freq_hz)
-    return jsonify(freq_hz=fg.freq_hz)
 
 
 @app.route("/api/tx/attn", methods=["GET", "POST"])
 def api_tx_attn():
-    fg = _get_tx()
-    if flask_request.method == "POST":
-        data = flask_request.get_json(silent=True) or {}
-        attn = float(data.get("attn_db", fg.attn_db))
-        fg.set_attn(attn)
+    with tx_api_lock:
+        fg = _get_tx()
+        if flask_request.method == "POST":
+            data = flask_request.get_json(silent=True) or {}
+            attn = float(data.get("attn_db", fg.attn_db))
+            fg.set_attn(attn)
+            return jsonify(attn_db=fg.attn_db)
         return jsonify(attn_db=fg.attn_db)
-    return jsonify(attn_db=fg.attn_db)
 
 
 @app.route("/api/tx/status", methods=["GET"])
 def api_tx_status():
-    if tx_fg is None:
-        return jsonify(running=False, mode=None, freq_hz=0, attn_db=30)
-    return jsonify(tx_fg.status_dict())
+    with tx_api_lock:
+        if tx_fg is None:
+            return jsonify(running=False, mode=None, freq_hz=0, attn_db=30)
+        return jsonify(tx_fg.status_dict())
 
 
 TX_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
@@ -671,9 +680,16 @@ def _mock_injector(state, interval_s: float = 2.0):
 def main():
     """Start RX thread, processor process, result drainer, and Flask."""
     state.running.set()
+    print(
+        f"[main] SDR_TYPE={config.SDR_TYPE!r} SDR_MODE={config.SDR_MODE!r}",
+        flush=True,
+    )
     mock_mode = config.SDR_TYPE == "mock"
+    tx_only = config.SDR_MODE == "tx_only"
 
-    if mock_mode:
+    if tx_only:
+        print("[main] TX-only mode — no RX, processor, or mock injector; Flask + /api/tx/* only.")
+    elif mock_mode:
         print("[main] Mock mode active — no SDR hardware required.")
         state.rx_connected.set()
         threading.Thread(target=_mock_injector, args=(state,), daemon=True).start()
