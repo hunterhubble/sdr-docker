@@ -539,8 +539,9 @@ def api_tx_status():
         return jsonify(tx_fg.status_dict())
 
 
-TX_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
-
+TX_MAX_UPLOAD_BYTES = int(
+    os.environ.get("TX_MAX_UPLOAD_BYTES", 1024 * 1024 * 1024) # 1 GB
+)
 
 def _file_sha256(path: str) -> str:
     import hashlib
