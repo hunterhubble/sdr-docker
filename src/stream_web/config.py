@@ -72,9 +72,13 @@ PLUTO_URI = os.environ.get("PLUTO_URI", "ip:192.168.2.1")
 # -- Signal Hound VSG60 (Soapy driver=SignalHoundVSG60), ignored unless SDR_TYPE == "signalhound"
 SIGNALHOUND_SERIAL = os.environ.get("SIGNALHOUND_SERIAL", "").strip()
 
-# TX output level mapping for Signal Hound (dBm; Soapy RF gain), used when SDR_TYPE == "signalhound"
-SIGNALHOUND_TX_DBM_MIN = float(os.environ.get("SIGNALHOUND_TX_DBM_MIN", "-120"))
-SIGNALHOUND_TX_DBM_MAX = float(os.environ.get("SIGNALHOUND_TX_DBM_MAX", "10"))
+# VSG60A output level (dBm) — CW specified range per product manual; API allows wider envelope.
+# https://signalhound.com/sigdownloads/VSG60/VSG60A-Product-Manual.pdf (Level: -55 to +7 dBm CW)
+SIGNALHOUND_TX_DBM_MIN = float(os.environ.get("SIGNALHOUND_TX_DBM_MIN", "-55"))
+SIGNALHOUND_TX_DBM_MAX = float(os.environ.get("SIGNALHOUND_TX_DBM_MAX", "7"))
+SIGNALHOUND_TX_DEFAULT_DBM = float(os.environ.get("SIGNALHOUND_TX_DEFAULT_DBM", "-20"))
+SIGNALHOUND_TX_DBM_STEP = float(os.environ.get("SIGNALHOUND_TX_DBM_STEP", "1"))
+VSG_MAX_DEVICES = 8
 
 # -- Radio parameters (shared across SDR backends) -------------------------
 CENTER_FREQ_HZ = 2_482_440_375

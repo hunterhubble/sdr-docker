@@ -6,7 +6,11 @@
 </head>
 <body>
   <h1>PlutoSDR Live Spectrogram + Decoder</h1>
-  <img id="spec" src="/spectrogram.jpg" />
+  {% if sdr_mode == 'tx_only' %}
+  <div class="spec-placeholder">TX-only mode — no live spectrogram. Use <strong>TX Control</strong> below.</div>
+  {% else %}
+  <img id="spec" src="/spectrogram.jpg" alt="Live spectrogram" />
+  {% endif %}
   <div class="stats">
     Total: <span id="pt">&mdash;</span> ms
     &nbsp;|&nbsp; Spec: <span id="ts">&mdash;</span> ms
@@ -102,10 +106,17 @@
       <input id="tx-file-input" type="text" placeholder="filename.out" style="width:180px" />
       <label><input id="tx-repeat-cb" type="checkbox" checked /> Repeat</label>
       <span class="toolbar-sep"></span>
+      {% if sdr_type == 'signalhound' %}
+      <span class="toolbar-label">TX Power (dBm):</span>
+      <button class="btn" onclick="txPower(-1)">&#x25BC;</button>
+      <span id="tx-power-val">{{ '%.1f'|format(tx_default_power_dbm) }}</span>
+      <button class="btn" onclick="txPower(1)">&#x25B2;</button>
+      {% else %}
       <span class="toolbar-label">TX Attn (dB):</span>
       <button class="btn" onclick="txAttn(-1)">&#x25BC;</button>
       <span id="tx-attn-val">30</span>
       <button class="btn" onclick="txAttn(1)">&#x25B2;</button>
+      {% endif %}
       <span class="toolbar-sep"></span>
       <span class="toolbar-label">Status:</span>
       <span id="tx-status">off</span>
@@ -152,7 +163,7 @@
       i.onerror = function() { setTimeout(refreshImg, 1000); };
       i.src = '/spectrogram.jpg?t=' + Date.now();
     }
-    refreshImg();
+    if (img) refreshImg();
 
     function hasSelection() {
       var sel = window.getSelection();
@@ -397,6 +408,7 @@
     function txStop() {
       txPost('/api/tx/stop', {}).then(txUpdateUI);
     }
+    var txIsSignalhound = {{ 'true' if sdr_type == 'signalhound' else 'false' }};
     function txAttn(dir) {
       fetch('/api/tx/attn').then(function(r){ return r.json(); }).then(function(d) {
         var cur = d.attn_db != null ? d.attn_db : 89;
@@ -405,11 +417,27 @@
         });
       });
     }
+    function txPower(dir) {
+      fetch('/api/tx/power').then(function(r){ return r.json(); }).then(function(d) {
+        var step = d.power_dbm_step != null ? d.power_dbm_step : 1;
+        var cur = d.power_dbm != null ? d.power_dbm : -20;
+        var lo = d.power_dbm_min != null ? d.power_dbm_min : -55;
+        var hi = d.power_dbm_max != null ? d.power_dbm_max : 7;
+        var next = Math.min(hi, Math.max(lo, cur + dir * step));
+        txPost('/api/tx/power', { power_dbm: next }).then(function(d2) {
+          document.getElementById('tx-power-val').textContent =
+            Number(d2.power_dbm).toFixed(1);
+        });
+      });
+    }
     function txUpdateUI(d) {
       if (!d) return;
       document.getElementById('tx-status').textContent =
         d.running ? (d.mode || 'on') : 'off';
-      if (d.attn_db !== undefined)
+      if (d.power_dbm !== undefined && document.getElementById('tx-power-val'))
+        document.getElementById('tx-power-val').textContent =
+          Number(d.power_dbm).toFixed(1);
+      if (d.attn_db !== undefined && document.getElementById('tx-attn-val'))
         document.getElementById('tx-attn-val').textContent = d.attn_db;
     }
     (function pollTx() {

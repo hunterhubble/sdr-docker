@@ -20,6 +20,18 @@ img {
   border-radius: 4px;
 }
 
+.spec-placeholder {
+  width: 100%;
+  min-height: 120px;
+  padding: 24px 16px;
+  border: 1px solid #333;
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #aaa;
+  text-align: center;
+  font-size: 0.95em;
+}
+
 /* -- Stats bar ------------------------------------------------------------- */
 
 .stats {

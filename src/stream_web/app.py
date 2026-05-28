@@ -32,13 +32,14 @@ from .processor import processor_main
 # GNU Radio imports — deferred so the app can be imported without GNU Radio
 # installed (e.g. SDR_TYPE=mock, CI tests).
 try:
-    from .gnuradio_tx import TX_SOURCE_DIR, TXFlowgraph
+    from .gnuradio_tx import TX_SOURCE_DIR, TXFlowgraph, create_tx_backend
     from .sdr import rx_loop
 except ImportError:
     TX_SOURCE_DIR = os.environ.get(
         "TX_SOURCE_DIR", os.path.join(os.path.dirname(__file__), "source_files")
     )
     TXFlowgraph = None  # type: ignore[assignment,misc]
+    create_tx_backend = None  # type: ignore[assignment,misc]
     rx_loop = None  # type: ignore[assignment]
 
 # ===========================================================================
@@ -207,7 +208,7 @@ class SharedState:
 
 
 state = SharedState()
-tx_fg: "TXFlowgraph | None" = None
+tx_fg: "TXFlowgraph | object | None" = None
 # GNU Radio top_block is not thread-safe; Flask serves /api/tx/* concurrently.
 tx_api_lock = threading.Lock()
 
@@ -224,7 +225,12 @@ if not config.VERBOSE:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        sdr_type=config.SDR_TYPE,
+        sdr_mode=config.SDR_MODE,
+        tx_default_power_dbm=config.SIGNALHOUND_TX_DEFAULT_DBM,
+    )
 
 
 @app.route("/spectrogram.jpg")
@@ -443,13 +449,20 @@ def api_packets():
 # TX API routes
 # ===========================================================================
 
-def _get_tx() -> TXFlowgraph:
-    """Lazy-init the TX flowgraph singleton."""
+def _get_tx():
+    """Lazy-init the TX backend singleton (GNU Radio Soapy or native VSG60)."""
     global tx_fg
     if tx_fg is None:
-        print("[TX] Initializing TXFlowgraph (opening SoapySDR sink)...", flush=True)
-        tx_fg = TXFlowgraph()
-        print("[TX] TXFlowgraph initialized.", flush=True)
+        if create_tx_backend is None:
+            raise RuntimeError("TX not available (GNU Radio not installed)")
+        label = (
+            "Signal Hound VSG60 (native API)"
+            if config.SDR_TYPE == "signalhound"
+            else "SoapySDR sink"
+        )
+        print(f"[TX] Initializing TX backend ({label})...", flush=True)
+        tx_fg = create_tx_backend()
+        print("[TX] TX backend initialized.", flush=True)
     return tx_fg
 
 
@@ -521,6 +534,10 @@ def api_tx_freq():
 
 @app.route("/api/tx/attn", methods=["GET", "POST"])
 def api_tx_attn():
+    if config.SDR_TYPE == "signalhound":
+        return jsonify(
+            error="Use /api/tx/power with power_dbm for Signal Hound VSG60",
+        ), 400
     with tx_api_lock:
         fg = _get_tx()
         if flask_request.method == "POST":
@@ -531,10 +548,40 @@ def api_tx_attn():
         return jsonify(attn_db=fg.attn_db)
 
 
+@app.route("/api/tx/power", methods=["GET", "POST"])
+def api_tx_power():
+    if config.SDR_TYPE != "signalhound":
+        return jsonify(
+            error="Use /api/tx/attn with attn_db for Pluto / bladeRF",
+        ), 400
+    with tx_api_lock:
+        fg = _get_tx()
+        if flask_request.method == "POST":
+            data = flask_request.get_json(silent=True) or {}
+            power = float(data.get("power_dbm", fg.power_dbm))
+            fg.set_level_dbm(power)
+            return jsonify(power_dbm=fg.power_dbm)
+        return jsonify(
+            power_dbm=fg.power_dbm,
+            power_dbm_min=config.SIGNALHOUND_TX_DBM_MIN,
+            power_dbm_max=config.SIGNALHOUND_TX_DBM_MAX,
+            power_dbm_step=config.SIGNALHOUND_TX_DBM_STEP,
+        )
+
+
 @app.route("/api/tx/status", methods=["GET"])
 def api_tx_status():
     with tx_api_lock:
         if tx_fg is None:
+            if config.SDR_TYPE == "signalhound":
+                return jsonify(
+                    running=False,
+                    mode=None,
+                    freq_hz=config.CENTER_FREQ_HZ,
+                    power_dbm=config.SIGNALHOUND_TX_DEFAULT_DBM,
+                    power_dbm_min=config.SIGNALHOUND_TX_DBM_MIN,
+                    power_dbm_max=config.SIGNALHOUND_TX_DBM_MAX,
+                )
             return jsonify(running=False, mode=None, freq_hz=0, attn_db=30)
         return jsonify(tx_fg.status_dict())
 

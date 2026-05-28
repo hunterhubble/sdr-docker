@@ -40,14 +40,13 @@ os.makedirs(TX_SOURCE_DIR, exist_ok=True)
 # TX Flowgraph
 # ---------------------------------------------------------------------------
 
-def _tx_sink_gain_db(attn_db: float) -> float:
-    """Soapy sink ``set_gain(0, value)``: Pluto uses fake gain from attenuation; VSG60 uses dBm."""
+def create_tx_backend():
+    """Return a TX controller: GNU Radio Soapy flowgraph or native Signal Hound VSG60."""
     if config.SDR_TYPE == "signalhound":
-        lo = config.SIGNALHOUND_TX_DBM_MIN
-        hi = config.SIGNALHOUND_TX_DBM_MAX
-        t = min(1.0, max(0.0, float(attn_db) / 89.75))
-        return hi - t * (hi - lo)
-    return 89.75 - attn_db
+        from .signalhound_tx import SignalHoundTX
+
+        return SignalHoundTX()
+    return TXFlowgraph()
 
 
 class TXFlowgraph(gr.top_block):
@@ -61,7 +60,7 @@ class TXFlowgraph(gr.top_block):
         self._sink.set_sample_rate(0, TX_SAMPLE_RATE)
         self._sink.set_frequency(0, TX_DEFAULT_FREQ_HZ)
         self._sink.set_bandwidth(0, TX_BANDWIDTH)
-        self._sink.set_gain(0, _tx_sink_gain_db(TX_DEFAULT_ATTN_DB))
+        self._sink.set_gain(0, 89.75 - TX_DEFAULT_ATTN_DB)
 
         self._source_block = None
         self._mode: str | None = None
@@ -142,13 +141,9 @@ class TXFlowgraph(gr.top_block):
         self._freq_hz = freq_hz
 
     def set_attn(self, attn_db: float) -> None:
-        """Set TX attenuation (0 = max power, 89.75 = min power).
-
-        For Pluto/bladeRF this maps to driver gain. For Signal Hound VSG60 the same
-        knob maps linearly to output level between SIGNALHOUND_TX_DBM_MAX and MIN.
-        """
+        """Set TX attenuation (0 = max power, 89.75 = min power) via Soapy sink gain."""
         attn_db = max(0.0, min(89.75, attn_db))
-        self._sink.set_gain(0, _tx_sink_gain_db(attn_db))
+        self._sink.set_gain(0, 89.75 - attn_db)
         self._attn_db = attn_db
 
     # -- status -------------------------------------------------------------
