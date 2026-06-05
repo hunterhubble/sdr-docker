@@ -108,7 +108,7 @@ SPEC_IMG_HEIGHT = 200
 
 # -- Decoder scheduling ----------------------------------------------------
 DECODE_WINDOW_S = 1.0
-DECODE_INTERVAL_S = 0.5
+DECODE_INTERVAL_S = 0.75
 DECODE_SAMPLES = int(DECODE_WINDOW_S * SAMPLE_RATE)
 
 # -- Web server & app behaviour --------------------------------------------

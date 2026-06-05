@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  repository_dispatch:
+    types: [dependency-updated]
 
 env:
   REGISTRY: ghcr.io
