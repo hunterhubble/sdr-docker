@@ -293,13 +293,8 @@ def api_status():
                 d["payload_b64"] = ""
 
         for d in devices.values():
-            seen = set()
-            unique_seqs = []
-            for s in d["seq_nums"]:
-                if s not in seen:
-                    seen.add(s)
-                    unique_seqs.append(s)
-            d["seq_nums"] = unique_seqs[-10:]
+            # Keep chronological order, including repeats after a wraparound.
+            d["seq_nums"] = d["seq_nums"][-10:]
             d.setdefault("freq_delta_hz", None)
             d.setdefault("payload_b64", "")
 
