@@ -15,8 +15,8 @@ detection and decoding.
 
 | Device | Interface | Notes |
 |--------|-----------|-------|
-| **ADALM-PLUTO (PlutoSDR)** | Ethernet (`ip:192.168.2.1`) or USB | Default. USB on Mac requires NCM firmware (see below) |
-| **Nuand bladeRF 2.0 Micro A4** | USB | Set `SDR_TYPE=bladerf` |
+| **[ADALM-PLUTO (PlutoSDR)](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/adalm-pluto.html#eb-overview)** | Ethernet (`ip:192.168.2.1`) or USB | Default. USB on Mac requires NCM firmware (see below) |
+| **[Nuand bladeRF 2.0 Micro A4](https://www.nuand.com/product/bladerf-xa4/)** | USB | Set `SDR_TYPE=bladerf` |
 
 All SDR hardware is accessed through a **single code path**: GNU Radio's
 `gr-soapy` block, which wraps SoapySDR.  Adding support for a new device
