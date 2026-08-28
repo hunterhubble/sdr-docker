@@ -9,6 +9,7 @@ import numpy as np  # noqa: E402
 from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+from scipy.signal import find_peaks  # noqa: E402
 from scipy.signal import spectrogram as scipy_spectrogram  # noqa: E402
 
 from . import config  # noqa: E402
@@ -31,6 +32,30 @@ except Exception:
 # Spectrogram image rendering
 # ===========================================================================
 
+def _interpolate_dc(spec: np.ndarray, half_bins: int) -> np.ndarray:
+    """Interpolate across +-``half_bins`` around the DC (centre) bin, in place.
+
+    Operates on the frequency axis (axis 0) and works for both a 2-D ``Sxx``
+    (freq x time) and a 1-D trace via broadcasting: the notched rows are
+    replaced with a linear blend of the two rows just outside the notch, so the
+    residual LO-leakage disappears from the display. Cosmetic only -- the caller
+    must pass a copy that never feeds the decoder.
+    """
+    if half_bins <= 0 or spec.shape[0] < 3:
+        return spec
+    n = spec.shape[0]
+    dc = n // 2
+    lo, hi = dc - half_bins, dc + half_bins
+    if lo - 1 < 0 or hi + 1 >= n:
+        return spec
+    below, above = spec[lo - 1], spec[hi + 1]
+    steps = (hi + 1) - (lo - 1)
+    for k, idx in enumerate(range(lo, hi + 1), start=1):
+        w = k / steps
+        spec[idx] = (1.0 - w) * below + w * above
+    return spec
+
+
 def render_spec_image(chunks: list[np.ndarray], detections: list[dict] | None = None) -> bytes:
     """Concat Sxx_dB chunks, apply viridis LUT, draw detection boxes, return JPEG bytes."""
     if not chunks:
@@ -43,6 +68,10 @@ def render_spec_image(chunks: list[np.ndarray], detections: list[dict] | None = 
         Sxx_dB = np.concatenate([pad, Sxx_all], axis=1)
     else:
         Sxx_dB = Sxx_all
+
+    # np.concatenate always returns a fresh array, so this never mutates the
+    # cached chunks (or the decoder's IQ).
+    _interpolate_dc(Sxx_dB, config.SPEC_DC_NOTCH_BINS)
 
     plow, phigh = np.percentile(Sxx_dB, [2, 99.5])
     if phigh <= plow:
@@ -87,6 +116,207 @@ def render_spec_image(chunks: list[np.ndarray], detections: list[dict] | None = 
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    return buf.read()
+
+
+# ===========================================================================
+# Spectrum analyzer (power vs frequency) rendering
+# ===========================================================================
+
+def _draw_fcc_tone_overlay(ax, freqs_mhz: np.ndarray, avg_dB: np.ndarray,
+                           bin_hz: float) -> None:
+    """Overlay an FCC 15.247 FHSS check on the strongest tone in ``avg_dB``.
+
+    Only draws when a tone stands at least ``FCC_OVERLAY_MIN_SNR_DB`` above the
+    noise-floor median. Aligned to the detected peak, it shows the allocated
+    channel band (``config.CHANNEL_SPACING``) and the 20 dB bandwidth, and
+    checks §15.247(a)(1): carrier separation must be >= 2/3 of the 20 dB
+    bandwidth (equivalently, 20 dB BW <= 1.5 x channel spacing).
+    """
+    noise_dB = float(np.median(avg_dB))
+    peak_idx = int(np.argmax(avg_dB))
+    peak_dB = float(avg_dB[peak_idx])
+    if peak_dB - noise_dB < config.FCC_OVERLAY_MIN_SNR_DB:
+        return  # no strong tone -> no overlay
+
+    peak_mhz = float(freqs_mhz[peak_idx])
+
+    # 20 dB-down bandwidth: walk out from the peak until the trace drops 20 dB.
+    thr_dB = peak_dB - 20.0
+    li = peak_idx
+    while li > 0 and avg_dB[li] > thr_dB:
+        li -= 1
+    ri = peak_idx
+    while ri < len(avg_dB) - 1 and avg_dB[ri] > thr_dB:
+        ri += 1
+    bw_hz = (ri - li) * bin_hz
+
+    spacing_hz = config.CHANNEL_SPACING
+    spacing_ok = (2.0 / 3.0) * bw_hz <= spacing_hz
+
+    pass_col, fail_col = "#4ade80", "#f87171"
+    # Distinct magenta accent for the carrier geometry so the marker doesn't
+    # blend with the cyan average / orange peak-hold traces.
+    accent = "#ff5ec4"
+    spacing_col = pass_col if spacing_ok else fail_col
+
+    half_ch_mhz = (spacing_hz / 2.0) / 1e6
+    ax.axvspan(peak_mhz - half_ch_mhz, peak_mhz + half_ch_mhz,
+               color=spacing_col, alpha=0.14, zorder=1)
+    ax.axvline(peak_mhz, color=accent, linewidth=2.0, alpha=1.0, zorder=6)
+    ax.text(peak_mhz, ax.get_ylim()[1], " carrier", color=accent, fontsize=8,
+            fontweight="bold", va="top", ha="left", fontfamily="monospace",
+            zorder=7)
+    ax.hlines(thr_dB, freqs_mhz[li], freqs_mhz[ri], colors=accent,
+              linewidth=1.4, zorder=6)
+    for xf in (freqs_mhz[li], freqs_mhz[ri]):
+        ax.plot([xf], [thr_dB], marker="|", markersize=10,
+                markeredgewidth=1.6, color=accent, zorder=6)
+
+    # -- Spurious emissions: peaks elsewhere in the band vs the -N dBc limit ---
+    limit_dbc = config.SPUR_LIMIT_DBC
+    limit_dB = peak_dB - limit_dbc
+    ax.axhline(limit_dB, color="#cbd5e1", linewidth=1.0, linestyle="--",
+               alpha=0.6, zorder=4)
+    ax.text(freqs_mhz[-1], limit_dB, f"-{limit_dbc:.0f} dBc ", color="#cbd5e1",
+            fontsize=7, va="bottom", ha="right", fontfamily="monospace",
+            alpha=0.85, zorder=4)
+
+    sep_bins = max(1, int(config.SPUR_MIN_SEP_KHZ * 1e3 / bin_hz))
+    cand, _ = find_peaks(
+        avg_dB,
+        height=noise_dB + config.SPUR_MIN_SNR_DB,
+        distance=sep_bins,
+        prominence=config.SPUR_MIN_PROMINENCE_DB,
+    )
+    # Exclude the carrier and its own skirt/channel from the spur list.
+    guard = max(peak_idx - li, ri - peak_idx, int(spacing_hz / 2 / bin_hz)) + 3
+    spurs = [int(p) for p in cand if abs(int(p) - peak_idx) > guard]
+
+    n_spur_fail = 0
+    worst_dbc = None
+    for p in spurs:
+        dbc = float(avg_dB[p]) - peak_dB  # negative: dB below carrier
+        if worst_dbc is None or dbc > worst_dbc:
+            worst_dbc = dbc
+        spur_ok = dbc <= -limit_dbc
+        if not spur_ok:
+            n_spur_fail += 1
+        scol = pass_col if spur_ok else fail_col
+        ax.plot([freqs_mhz[p]], [avg_dB[p]], marker="v", markersize=7,
+                color=scol, zorder=6)
+        ax.text(freqs_mhz[p], avg_dB[p] + 1.5, f"{dbc:.0f}", color=scol,
+                fontsize=7, va="bottom", ha="center", fontfamily="monospace",
+                zorder=6)
+
+    overall_ok = spacing_ok and n_spur_fail == 0
+    box_col = pass_col if overall_ok else fail_col
+
+    def _row(label: str, value: str) -> str:
+        return f"{label:<9}{value}"
+
+    lines = [
+        "FCC 15.247 compliance",
+        _row("carrier", f"{peak_mhz:.5f} MHz  {peak_dB:.1f} dB"),
+        _row("20 dB BW", f"{bw_hz / 1e3:.2f} kHz"),
+        _row("spacing", f"{'PASS' if spacing_ok else 'FAIL'}  "
+                        f"(2/3 BW <= {spacing_hz / 1e3:.2f} kHz)"),
+    ]
+    if spurs:
+        lines.append(_row("spurs", f"{len(spurs)} found, worst {worst_dbc:.1f} dBc"))
+        lines.append(_row("spur att", f"{'PASS' if n_spur_fail == 0 else 'FAIL'}  "
+                          + (f"(limit -{limit_dbc:.0f} dBc)" if n_spur_fail == 0
+                             else f"({n_spur_fail} over -{limit_dbc:.0f} dBc)")))
+    else:
+        lines.append(_row("spurs", "none"))
+        lines.append(_row("spur att", f"PASS  (limit -{limit_dbc:.0f} dBc)"))
+    ax.text(0.01, 0.97, "\n".join(lines), transform=ax.transAxes,
+            fontsize=8, color=box_col, fontfamily="monospace",
+            va="top", ha="left",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="#1a1a2e",
+                      edgecolor=box_col, alpha=0.92), zorder=7)
+
+
+def render_spectrum_image(chunks: list[np.ndarray], lo_freq_hz: float) -> bytes:
+    """Render a spectrum-analyzer trace (power vs absolute frequency).
+
+    Collapses the same Sxx_dB chunks used by the spectrogram over the time
+    axis into an *average* trace (proper linear-power mean) plus a *peak-hold*
+    trace, so the frequency of interest (``lo_freq_hz``) sits at the centre and
+    the captured band spans the full width of the view.  Returns JPEG bytes so
+    it can be served through the existing ``/spectrogram.jpg`` slot.
+    """
+    if not chunks:
+        return b""
+
+    # Average over a shorter window than the spectrogram so the trace reacts
+    # faster to changes.
+    chunks = chunks[-config.SPECTRUM_AVG_CHUNKS:]
+    Sxx_dB = np.concatenate(chunks, axis=1)
+    n_bins = Sxx_dB.shape[0]
+
+    # Average in the linear-power domain (mean of dB understates real power),
+    # and hold the max over the visible window as a peak trace.
+    lin = np.power(10.0, Sxx_dB / 10.0)
+    avg_dB = 10.0 * np.log10(np.mean(lin, axis=1) + 1e-12)
+    peak_dB = np.max(Sxx_dB, axis=1)
+
+    # compute_spec_chunk zeroes the DC bin (a -120 dB notch at the exact centre
+    # frequency) and LO leakage smears into a few neighbours; interpolate across
+    # +-SPEC_DC_NOTCH_BINS so the trace isn't a spike/notch at our frequency of
+    # interest. Cosmetic only -- these traces never feed the decoder.
+    _interpolate_dc(avg_dB, config.SPEC_DC_NOTCH_BINS)
+    _interpolate_dc(peak_dB, config.SPEC_DC_NOTCH_BINS)
+
+    # Frequency axis: bins run -fs/2 .. +fs/2 (ascending), centred on the LO.
+    fs = config.SAMPLE_RATE
+    freqs_mhz = (np.linspace(-fs / 2.0, fs / 2.0, n_bins) + lo_freq_hz) / 1e6
+    center_mhz = lo_freq_hz / 1e6
+
+    dpi = 100
+    fig = Figure(
+        figsize=(config.SPEC_IMG_WIDTH / dpi, (config.SPEC_IMG_HEIGHT + 60) / dpi),
+        dpi=dpi, facecolor="#0f0f23",
+    )
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(1, 1, 1)
+    ax.set_facecolor("#1a1a2e")
+
+    ax.plot(freqs_mhz, peak_dB, color="#f59e0b", linewidth=0.8, alpha=0.55,
+            label="peak hold")
+    ax.plot(freqs_mhz, avg_dB, color="#7fdbca", linewidth=1.3, label="average")
+
+    ax.axvline(center_mhz, color="#3399ff", linewidth=1.2, linestyle="--",
+               alpha=0.9)
+
+    y_lo = float(np.percentile(avg_dB, 2)) - 5.0
+    y_hi = float(np.max(peak_dB)) + 5.0
+    if y_hi <= y_lo:
+        y_hi = y_lo + 1.0
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_xlim(freqs_mhz[0], freqs_mhz[-1])
+
+    # FCC compliance overlay locked onto the strongest tone (skipped if none).
+    _draw_fcc_tone_overlay(ax, freqs_mhz, avg_dB, fs / n_bins)
+
+    ax.text(center_mhz, y_hi, f" {center_mhz:.5f} MHz", color="#3399ff",
+            fontsize=8, fontweight="bold", va="top", ha="left",
+            fontfamily="monospace")
+
+    ax.set_xlabel("Frequency (MHz)", color="#ccc", fontsize=9)
+    ax.set_ylabel("Power (dB)", color="#ccc", fontsize=9)
+    ax.tick_params(colors="#888", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#333")
+    ax.grid(True, color="#333", linewidth=0.3, alpha=0.6)
+    ax.legend(loc="upper right", fontsize=8, facecolor="#1a1a2e",
+              edgecolor="#333", labelcolor="#ccc")
+
+    fig.tight_layout(pad=0.5)
+
+    buf = io.BytesIO()
+    canvas.print_jpg(buf)
     buf.seek(0)
     return buf.read()
 

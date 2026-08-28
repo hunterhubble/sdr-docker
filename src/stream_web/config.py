@@ -83,6 +83,11 @@ SPEC_CHUNK_S = 0.5
 SPEC_CHUNK_SAMPLES = int(SPEC_CHUNK_S * SAMPLE_RATE)
 MAX_SPEC_CHUNKS = int(SPEC_DURATION_S / SPEC_CHUNK_S)
 
+# Spectrum-analyzer averaging window: number of recent 0.5 s chunks to average
+# into the trace. Shorter than MAX_SPEC_CHUNKS (the full spectrogram window) so
+# the spectrum reacts faster to changes -- half the window = ~2x faster.
+SPECTRUM_AVG_CHUNKS = max(1, MAX_SPEC_CHUNKS // 2)
+
 # IQ circular buffer: ~2 s for decode + headroom
 IQ_BUFFER_DURATION_S = 2.0
 IQ_BUFFER_SIZE = int(IQ_BUFFER_DURATION_S * SAMPLE_RATE)
@@ -90,6 +95,31 @@ IQ_BUFFER_SIZE = int(IQ_BUFFER_DURATION_S * SAMPLE_RATE)
 # Target image size for web display
 SPEC_IMG_WIDTH = 1200
 SPEC_IMG_HEIGHT = 200
+
+# Cosmetic only: interpolate across +-N FFT bins around DC to hide residual
+# LO-leakage in the spectrogram/spectrum *display*. Operates on the rendered
+# Sxx copy, never on the decoder's IQ, so it cannot affect decode. At
+# NFFT_VIS=4096 each bin is ~191 Hz. The leakage skirt reaches ~10 bins out
+# before it settles into the noise floor, so 10 bins (~+-1.9 kHz) is needed for
+# the notch anchors to sit at noise -- still far narrower than a ~20 kHz FSK
+# channel. Set to 0 to disable.
+SPEC_DC_NOTCH_BINS = 10
+
+# FCC-compliance overlay on the spectrum-analyzer view: draw an overlay on the
+# strongest tone only when it rises at least this many dB above the noise-floor
+# median (so a quiet band shows no overlay).
+FCC_OVERLAY_MIN_SNR_DB = 15.0
+
+# Spurious-emission detection on the spectrum-analyzer view. Peaks (other than
+# the main carrier) that stand SPUR_MIN_SNR_DB above the noise floor are flagged
+# and checked against SPUR_LIMIT_DBC: FCC 15.247(d) requires spurs to be at
+# least 20 dB below the in-band carrier. SPUR_MIN_SEP_KHZ is the minimum
+# frequency separation between distinct detected peaks; SPUR_MIN_PROMINENCE_DB
+# rejects shoulders/sidelobes of stronger peaks.
+SPUR_MIN_SNR_DB = 10.0
+SPUR_MIN_PROMINENCE_DB = 6.0
+SPUR_MIN_SEP_KHZ = 10.0
+SPUR_LIMIT_DBC = 20.0
 
 # -- Decoder scheduling ----------------------------------------------------
 # Decode window is 2.5x the Decode interval, so packets that overlap

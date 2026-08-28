@@ -28,6 +28,9 @@ from .gnuradio_rx import _soapy_driver_args
 
 TX_DEFAULT_FREQ_HZ: int = config.CENTER_FREQ_HZ
 TX_DEFAULT_ATTN_DB: float = 30.0
+# Baseband offset applied to the CW tone so it lands 100 kHz above the LO
+# (i.e. off the RX centre frequency) instead of sitting on top of it.
+TX_TONE_OFFSET_HZ: int = 100_000
 TX_SAMPLE_RATE: int = config.SAMPLE_RATE
 TX_BANDWIDTH: int = config.RF_BANDWIDTH
 TX_SOURCE_DIR: str = os.environ.get(
@@ -63,7 +66,12 @@ class TXFlowgraph(gr.top_block):
     # -- mode switching -----------------------------------------------------
 
     def tone_mode(self) -> None:
-        """Configure a CW tone source (constant I+jQ = 1+0j)."""
+        """Configure a CW tone offset ``TX_TONE_OFFSET_HZ`` above the LO.
+
+        Generated as a complex exponential at baseband so the transmitted
+        carrier appears at ``freq_hz + TX_TONE_OFFSET_HZ`` — 100 kHz off the
+        shared RX centre frequency rather than on top of it.
+        """
         with self._lock:
             was_running = self._running
             if was_running:
@@ -71,7 +79,9 @@ class TXFlowgraph(gr.top_block):
                 self.wait()
             if self._source_block is not None:
                 self.disconnect_all()
-            src = analog.sig_source_c(0, analog.GR_CONST_WAVE, 0, 1, 0)
+            src = analog.sig_source_c(
+                TX_SAMPLE_RATE, analog.GR_COS_WAVE, TX_TONE_OFFSET_HZ, 1.0, 0,
+            )
             self.connect(src, self._sink)
             self._source_block = src
             self._mode = "tone"

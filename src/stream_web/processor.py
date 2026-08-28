@@ -8,7 +8,9 @@ Communicates with the main process via:
 
 Time-domain plot rendering (the Signal Viewer's failure/device-id capture)
 is handed off to a separate td_renderer process rather than done inline, for
-the same GIL-contention reason -- see td_renderer.py.
+the same GIL-contention reason -- see td_renderer.py. The spectrum-analyzer
+trace (FCC-overlay/spur-search + matplotlib draw) is offloaded the same way,
+to spectrum_renderer.py.
 """
 
 import queue
@@ -28,8 +30,9 @@ from .timing import correct_symbol_edges, edges_to_timing_stats
 def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
                    rx_overflows_val, rx_gain_dB_val, td_running_val,
                    td_ntw_id_val, td_has_ntw_val, td_chipset_arr,
-                   td_zoom_n_syms_val,
-                   running_event, drop_queue, result_queue, td_job_queue):
+                   td_zoom_n_syms_val, view_mode_val, lo_freq_val,
+                   running_event, drop_queue, result_queue, td_job_queue,
+                   spectrum_job_queue):
     """Entry point for the processor process."""
 
     shm = shared_memory.SharedMemory(name=shm_name, create=False)
@@ -65,6 +68,19 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
             pass
         try:
             td_job_queue.put_nowait((td_seg, decode_info, n_syms))
+        except queue.Full:
+            pass
+
+    # Same reasoning as _submit_td_render above: the spectrum-analyzer trace
+    # (FCC-overlay/spur-search + matplotlib draw) is heavy enough that it
+    # needs a fully separate process too -- see spectrum_renderer.py.
+    def _submit_spectrum_render(chunks, lo_freq_hz):
+        try:
+            spectrum_job_queue.get_nowait()  # drop a stale pending request, if any
+        except queue.Empty:
+            pass
+        try:
+            spectrum_job_queue.put_nowait((chunks, lo_freq_hz))
         except queue.Full:
             pass
 
@@ -180,13 +196,20 @@ def processor_main(shm_name, buf_write_idx_val, rx_peak_frac_val,
                     "chipset": det.get("chipset", "v-1"),
                 })
 
-        # 4) Render spectrogram
+        # 4) Render spectrogram, or hand off to the spectrum-analyzer renderer
         t_render0 = time.perf_counter()
         img_bytes = b""
-        try:
-            img_bytes = render_spec_image(list(spec_chunks), detection_history)
-        except Exception as e:
-            print(f"[PROC] Render error: {e}")
+        if int(view_mode_val.value) == 1:
+            # Same reasoning as td_job_queue above: matplotlib rendering is
+            # too heavy to do inline here. This cycle's own result carries
+            # no image; the renderer pushes its own "img" once ready
+            # (mirrors td_img staying None on the processor's own result).
+            _submit_spectrum_render(list(spec_chunks), lo_freq_val.value)
+        else:
+            try:
+                img_bytes = render_spec_image(list(spec_chunks), detection_history)
+            except Exception as e:
+                print(f"[PROC] Render error: {e}")
         t_render_ms = (time.perf_counter() - t_render0) * 1000
 
         dt_ms = (time.perf_counter() - t0) * 1000

@@ -28,6 +28,9 @@
     <button class="btn" onclick="adjustLo(-1)">&#x25BC;</button>
     <span id="lo-display" class="toolbar-value">--</span>
     <button class="btn" onclick="adjustLo(1)">&#x25B2;</button>
+    <span class="toolbar-sep"></span>
+    <span class="toolbar-label">View:</span>
+    <button class="btn" id="view-btn" onclick="toggleView()">Spectrogram</button>
   </div>
   <div class="tab-bar">
     <button class="tab-btn active" onclick="switchTab('decodes')">Decodes</button>
@@ -159,6 +162,8 @@
     var tdChipBtns    = document.getElementById('td-chipset-btns');
     var tdDetailEl    = document.getElementById('td-detail');
     var loDisplay     = document.getElementById('lo-display');
+    var viewBtnEl     = document.getElementById('view-btn');
+    var viewMode      = 'spectrogram';
     var tdInnerTabs   = document.getElementById('td-inner-tabs');
     var tdTabFullBtn  = document.getElementById('td-tab-full-btn');
     var tdTabZoomBtn  = document.getElementById('td-tab-zoom-btn');
@@ -214,6 +219,11 @@
 
         if (d.lo_freq_hz) {
           loDisplay.textContent = (d.lo_freq_hz / 1e9).toFixed(6) + ' GHz';
+        }
+
+        if (d.view_mode && d.view_mode !== viewMode) {
+          viewMode = d.view_mode;
+          syncViewBtn();
         }
 
         if (!skipTables && d.devices && d.devices.length > 0) {
@@ -351,6 +361,24 @@
         if (d.lo_freq_hz) {
           loDisplay.textContent = (d.lo_freq_hz / 1e9).toFixed(6) + ' GHz';
         }
+      });
+    }
+
+    function syncViewBtn() {
+      viewBtnEl.textContent = viewMode === 'spectrum' ? 'Spectrum' : 'Spectrogram';
+      viewBtnEl.className = 'btn' + (viewMode === 'spectrum' ? ' btn-go' : '');
+    }
+
+    function toggleView() {
+      var next = viewMode === 'spectrum' ? 'spectrogram' : 'spectrum';
+      viewMode = next;
+      syncViewBtn();
+      fetch('/api/view', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: next })
+      }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.view_mode) { viewMode = d.view_mode; syncViewBtn(); }
       });
     }
 
