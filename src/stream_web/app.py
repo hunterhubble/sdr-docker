@@ -29,6 +29,7 @@ from hubble_satnet_decoder import reset_chipset_stats
 
 from . import analysis, config
 from .processor import processor_main
+from .spectrum_renderer import spectrum_renderer_main
 from .td_renderer import td_renderer_main
 
 # GNU Radio imports — deferred so the app can be imported without GNU Radio
@@ -114,6 +115,10 @@ class SharedState:
         # --- time-domain render requests (processor→td_renderer); single
         # slot -- only the freshest pending capture is ever worth rendering
         self.td_job_queue: mp.Queue = mp.Queue(1)
+
+        # --- spectrum-analyzer render requests (processor→spectrum_renderer);
+        # single slot, same reasoning as td_job_queue.
+        self.spectrum_job_queue: mp.Queue = mp.Queue(1)
 
         # --- worker processes + their spawn closures (for the watchdog) ---
         self.workers: dict = {}
@@ -856,9 +861,10 @@ def _drain_results(state):
 def _worker_watchdog(state, poll_s: float = 1.0):
     """Restart a worker process if it dies while the app is still running.
 
-    Both workers are safe to re-spawn: the td_renderer is stateless, and the
-    processor simply re-attaches to the shared-memory IQ buffer and resumes
-    (losing only in-memory visual history, which self-heals within seconds).
+    All three workers are safe to re-spawn: the td_renderer and
+    spectrum_renderer are stateless, and the processor simply re-attaches to
+    the shared-memory IQ buffer and resumes (losing only in-memory visual
+    history, which self-heals within seconds).
 
     A crash-looping worker (more than _WORKER_MAX_RESTARTS deaths within
     _WORKER_RESTART_WINDOW_S) is given up on so a persistent bug can't turn
@@ -971,6 +977,7 @@ def main():
                     state.drop_queue,
                     state.result_queue,
                     state.td_job_queue,
+                    state.spectrum_job_queue,
                 ),
                 daemon=True,
             )
@@ -982,17 +989,26 @@ def main():
                 daemon=True,
             )
 
+        def _spawn_spectrum_renderer():
+            return mp.Process(
+                target=spectrum_renderer_main,
+                args=(state.spectrum_job_queue, state.result_queue, state.running),
+                daemon=True,
+            )
+
         state.workers = {"processor": _spawn_processor(),
-                         "td_renderer": _spawn_td_renderer()}
+                         "td_renderer": _spawn_td_renderer(),
+                         "spectrum_renderer": _spawn_spectrum_renderer()}
         state.worker_spawns = {"processor": _spawn_processor,
-                              "td_renderer": _spawn_td_renderer}
+                              "td_renderer": _spawn_td_renderer,
+                              "spectrum_renderer": _spawn_spectrum_renderer}
         for p in state.workers.values():
             p.start()
 
         threading.Thread(target=rx_loop, args=(state,), daemon=True).start()
         threading.Thread(target=_drain_results, args=(state,), daemon=True).start()
         threading.Thread(target=_worker_watchdog, args=(state,), daemon=True).start()
-        print("[main] RX thread + processor process + td_renderer process started.")
+        print("[main] RX thread + processor/td_renderer/spectrum_renderer processes started.")
 
     print(f"[main] Open http://localhost:{config.FLASK_PORT} in a browser.")
 
