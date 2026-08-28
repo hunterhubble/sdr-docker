@@ -39,14 +39,14 @@ RUN apt-get update && \
 RUN git clone --depth 1 https://github.com/pothosware/SoapyPlutoSDR.git /tmp/SoapyPlutoSDR && \
     cd /tmp/SoapyPlutoSDR && mkdir build && cd build && \
     cmake .. && make -j"$(nproc)" && make install && \
-    rm -rf /tmp/SoapyPlutoSDR && \
+    cd / && rm -rf /tmp/SoapyPlutoSDR && \
     ldconfig
 
 # Build SoapyBladeRF module from source (bladeRF via gr-soapy)
 RUN git clone --depth 1 https://github.com/pothosware/SoapyBladeRF.git /tmp/SoapyBladeRF && \
     cd /tmp/SoapyBladeRF && mkdir build && cd build && \
     cmake .. && make -j"$(nproc)" && make install && \
-    rm -rf /tmp/SoapyBladeRF && \
+    cd / && rm -rf /tmp/SoapyBladeRF && \
     ldconfig
 
 # Pre-download bladeRF FPGA image so the entrypoint can load it at runtime
