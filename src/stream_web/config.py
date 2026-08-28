@@ -89,7 +89,8 @@ MAX_SPEC_CHUNKS = int(SPEC_DURATION_S / SPEC_CHUNK_S)
 SPECTRUM_AVG_CHUNKS = max(1, MAX_SPEC_CHUNKS // 2)
 
 # IQ circular buffer: ~2 s for decode + headroom
-IQ_BUFFER_SIZE = int(2.0 * SAMPLE_RATE)
+IQ_BUFFER_DURATION_S = 2.0
+IQ_BUFFER_SIZE = int(IQ_BUFFER_DURATION_S * SAMPLE_RATE)
 
 # Target image size for web display
 SPEC_IMG_WIDTH = 1200
@@ -142,6 +143,23 @@ SDR_RETRY_INTERVAL_S = 3
 
 # -- Time-domain viewer ----------------------------------------------------
 TD_WINDOW_S = 0.75
+
+# Cap on pending-capture age: must stay below the buffer duration, else a
+# stale hit's absolute position aliases back into the window (see processor.py).
+_TD_MAX_AGE_S = 0.9 * IQ_BUFFER_DURATION_S  # 10% headroom for scheduling jitter
+
+# Retry a not-yet-renderable hit across cycles for this long, then give up.
+TD_PENDING_TIMEOUT_S = min(3.0, _TD_MAX_AGE_S)
+# Hold a truncation-only failure this long to confirm it's real, not a
+# window-boundary cutoff (see _TRUNCATION_REASONS in td_capture.py).
+TD_TRUNCATION_CONFIRM_S = min(2.0, _TD_MAX_AGE_S)
+# Tolerance for matching the same packet across cycles by start sample.
+TD_TRUNCATION_MATCH_S = 0.01
+# Padding around a decoded packet's span when suppressing phantom detections.
+TD_PHANTOM_PAD_S = 0.02
+# Fraction of the render window placed before the packet start (pre-roll), so
+# the captured plot shows a little lead-in rather than starting exactly on it.
+TD_PRE_ROLL_FRAC = 0.1
 
 # -- Sync hubble_satnet_decoder with this SDR config -----------------------
 _fdc.CHANNEL_SPACING = 25_750.0

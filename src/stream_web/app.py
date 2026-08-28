@@ -29,6 +29,7 @@ from hubble_satnet_decoder import reset_chipset_stats
 
 from . import analysis, config
 from .processor import processor_main
+from .td_renderer import td_renderer_main
 
 # GNU Radio imports — deferred so the app can be imported without GNU Radio
 # installed (e.g. SDR_TYPE=mock, CI tests).
@@ -48,6 +49,13 @@ except ImportError:
 
 _IQ_SHM_NAME = "pluto_iq_buf"
 _IQ_NBYTES = config.IQ_BUFFER_SIZE * np.dtype(np.complex64).itemsize
+
+# Worker-process restart budget: a worker that dies more than
+# _WORKER_MAX_RESTARTS times within _WORKER_RESTART_WINDOW_S is assumed to be
+# crash-looping (persistent bug, not a transient fault), and the watchdog
+# stops restarting it rather than hot-looping forever.
+_WORKER_MAX_RESTARTS = 5
+_WORKER_RESTART_WINDOW_S = 60.0
 
 
 class SharedState:
@@ -100,8 +108,16 @@ class SharedState:
         # --- drop positions (RX→processor, lock-free via mp.Queue) ---
         self.drop_queue: mp.Queue = mp.Queue()
 
-        # --- results coming back from processor (via mp.Queue) ---
+        # --- results coming back from processor / td_renderer (via mp.Queue) ---
         self.result_queue: mp.Queue = mp.Queue()
+
+        # --- time-domain render requests (processor→td_renderer); single
+        # slot -- only the freshest pending capture is ever worth rendering
+        self.td_job_queue: mp.Queue = mp.Queue(1)
+
+        # --- worker processes + their spawn closures (for the watchdog) ---
+        self.workers: dict = {}
+        self.worker_spawns: dict = {}
 
         # --- main-process-only state (Flask / result drainer) ---
         self.spec_chunks: deque = deque(maxlen=config.MAX_SPEC_CHUNKS)
@@ -288,13 +304,8 @@ def api_status():
                 d["payload_b64"] = ""
 
         for d in devices.values():
-            seen = set()
-            unique_seqs = []
-            for s in d["seq_nums"]:
-                if s not in seen:
-                    seen.add(s)
-                    unique_seqs.append(s)
-            d["seq_nums"] = unique_seqs[-10:]
+            # Keep chronological order, including repeats after a wraparound.
+            d["seq_nums"] = d["seq_nums"][-10:]
             d.setdefault("freq_delta_hz", None)
             d.setdefault("payload_b64", "")
 
@@ -842,6 +853,46 @@ def _drain_results(state):
                 state.td_iq_segment = r["td_iq_segment"]
 
 
+def _worker_watchdog(state, poll_s: float = 1.0):
+    """Restart a worker process if it dies while the app is still running.
+
+    Both workers are safe to re-spawn: the td_renderer is stateless, and the
+    processor simply re-attaches to the shared-memory IQ buffer and resumes
+    (losing only in-memory visual history, which self-heals within seconds).
+
+    A crash-looping worker (more than _WORKER_MAX_RESTARTS deaths within
+    _WORKER_RESTART_WINDOW_S) is given up on so a persistent bug can't turn
+    into an infinite respawn loop.
+    """
+    restarts: dict = {}  # name -> list of recent restart timestamps
+    gave_up: set = set()
+    while state.running.is_set():
+        for name, proc in list(state.workers.items()):
+            if proc.is_alive() or name in gave_up or not state.running.is_set():
+                continue
+            proc.join(timeout=0)  # reap the dead child so it isn't a zombie
+
+            now = time.monotonic()
+            recent = [t for t in restarts.get(name, []) if now - t < _WORKER_RESTART_WINDOW_S]
+            if len(recent) >= _WORKER_MAX_RESTARTS:
+                gave_up.add(name)
+                print(f"[main] ERROR: worker '{name}' crash-looped "
+                      f"({_WORKER_MAX_RESTARTS}x in {_WORKER_RESTART_WINDOW_S:.0f}s); "
+                      f"giving up. Signal Viewer capture may be degraded.",
+                      flush=True)
+                continue
+
+            recent.append(now)
+            restarts[name] = recent
+            print(f"[main] WARNING: worker '{name}' died "
+                  f"(exit code {proc.exitcode}); restarting "
+                  f"({len(recent)}/{_WORKER_MAX_RESTARTS}).", flush=True)
+            new_proc = state.worker_spawns[name]()
+            new_proc.start()
+            state.workers[name] = new_proc
+        time.sleep(poll_s)
+
+
 # ===========================================================================
 # Mock mode — synthetic packet injector (SDR_TYPE=mock)
 # ===========================================================================
@@ -897,33 +948,51 @@ def main():
         state.rx_connected.set()
         threading.Thread(target=_mock_injector, args=(state,), daemon=True).start()
     else:
-        # Fork the processor BEFORE starting any threads (safe on macOS)
-        proc = mp.Process(
-            target=processor_main,
-            args=(
-                _IQ_SHM_NAME,
-                state._buf_write_idx,
-                state._rx_peak_frac,
-                state._rx_overflows,
-                state._rx_gain_dB,
-                state._td_running,
-                state._td_target_ntw_id,
-                state._td_has_ntw_id,
-                state._td_chipset_arr,
-                state._td_zoom_n_syms,
-                state._view_mode,
-                state._lo_freq_hz,
-                state.running,
-                state.drop_queue,
-                state.result_queue,
-            ),
-            daemon=True,
-        )
-        proc.start()
+        # Fork the worker processes BEFORE starting any threads (safe on macOS).
+        # Each is described by a spawn closure so the watchdog can re-create it
+        # if it dies (mp.Process objects can't be restarted in place).
+        def _spawn_processor():
+            return mp.Process(
+                target=processor_main,
+                args=(
+                    _IQ_SHM_NAME,
+                    state._buf_write_idx,
+                    state._rx_peak_frac,
+                    state._rx_overflows,
+                    state._rx_gain_dB,
+                    state._td_running,
+                    state._td_target_ntw_id,
+                    state._td_has_ntw_id,
+                    state._td_chipset_arr,
+                    state._td_zoom_n_syms,
+                    state._view_mode,
+                    state._lo_freq_hz,
+                    state.running,
+                    state.drop_queue,
+                    state.result_queue,
+                    state.td_job_queue,
+                ),
+                daemon=True,
+            )
+
+        def _spawn_td_renderer():
+            return mp.Process(
+                target=td_renderer_main,
+                args=(state.td_job_queue, state.result_queue, state.running),
+                daemon=True,
+            )
+
+        state.workers = {"processor": _spawn_processor(),
+                         "td_renderer": _spawn_td_renderer()}
+        state.worker_spawns = {"processor": _spawn_processor,
+                              "td_renderer": _spawn_td_renderer}
+        for p in state.workers.values():
+            p.start()
 
         threading.Thread(target=rx_loop, args=(state,), daemon=True).start()
         threading.Thread(target=_drain_results, args=(state,), daemon=True).start()
-        print("[main] RX thread + processor process started.")
+        threading.Thread(target=_worker_watchdog, args=(state,), daemon=True).start()
+        print("[main] RX thread + processor process + td_renderer process started.")
 
     print(f"[main] Open http://localhost:{config.FLASK_PORT} in a browser.")
 
