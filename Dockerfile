@@ -36,18 +36,20 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Build SoapyPlutoSDR module from source (PlutoSDR via gr-soapy)
+# No ldconfig here: SoapySDR dlopen()s these modules by absolute path, so they
+# never go through the ld.so cache. Running ldconfig under the arm64 leg's QEMU
+# emulation segfaults intermittently (~12% of calls), which is what made the
+# multi-arch build fail at random steps.
 RUN git clone --depth 1 https://github.com/pothosware/SoapyPlutoSDR.git /tmp/SoapyPlutoSDR && \
     cd /tmp/SoapyPlutoSDR && mkdir build && cd build && \
     cmake .. && make -j"$(nproc)" && make install && \
-    cd / && rm -rf /tmp/SoapyPlutoSDR && \
-    ldconfig
+    cd / && rm -rf /tmp/SoapyPlutoSDR
 
 # Build SoapyBladeRF module from source (bladeRF via gr-soapy)
 RUN git clone --depth 1 https://github.com/pothosware/SoapyBladeRF.git /tmp/SoapyBladeRF && \
     cd /tmp/SoapyBladeRF && mkdir build && cd build && \
     cmake .. && make -j"$(nproc)" && make install && \
-    cd / && rm -rf /tmp/SoapyBladeRF && \
-    ldconfig
+    cd / && rm -rf /tmp/SoapyBladeRF
 
 # Pre-download bladeRF FPGA image so the entrypoint can load it at runtime
 RUN mkdir -p /opt/bladerf && \
