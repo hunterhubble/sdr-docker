@@ -124,23 +124,54 @@ def render_spec_image(chunks: list[np.ndarray], detections: list[dict] | None = 
 # Spectrum analyzer (power vs frequency) rendering
 # ===========================================================================
 
-def _draw_fcc_tone_overlay(ax, freqs_mhz: np.ndarray, avg_dB: np.ndarray,
-                           bin_hz: float) -> None:
-    """Overlay an FCC 15.247 FHSS check on the strongest tone in ``avg_dB``.
+def spectrum_traces(chunks: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Collapse Sxx_dB chunks over the time axis into (average, peak-hold) traces.
 
-    Only draws when a tone stands at least ``FCC_OVERLAY_MIN_SNR_DB`` above the
-    noise-floor median. Aligned to the detected peak, it shows the allocated
-    channel band (``config.CHANNEL_SPACING``) and the 20 dB bandwidth, and
-    checks §15.247(a)(1): carrier separation must be >= 2/3 of the 20 dB
-    bandwidth (equivalently, 20 dB BW <= 1.5 x channel spacing).
+    The average is a proper linear-power mean (a mean of dB understates real
+    power); the peak hold is the per-bin max over the window.
+
+    Both get the DC notch interpolated away: compute_spec_chunk zeroes the DC
+    bin (a -120 dB notch at the exact centre frequency) and LO leakage smears
+    into a few neighbours. For the display that is cosmetic; for the compliance
+    check it also stops residual LO leakage from being scored as the carrier.
+
+    Callers window the input themselves (``chunks[-N:]``); this does not slice.
+    """
+    Sxx_dB = np.concatenate(chunks, axis=1)
+    lin = np.power(10.0, Sxx_dB / 10.0)
+    avg_dB = 10.0 * np.log10(np.mean(lin, axis=1) + 1e-12)
+    peak_dB = np.max(Sxx_dB, axis=1)
+    _interpolate_dc(avg_dB, config.SPEC_DC_NOTCH_BINS)
+    _interpolate_dc(peak_dB, config.SPEC_DC_NOTCH_BINS)
+    return avg_dB, peak_dB
+
+
+def evaluate_fcc_compliance(freqs_hz: np.ndarray, avg_dB: np.ndarray,
+                            bin_hz: float) -> dict | None:
+    """Evaluate FCC 15.247 compliance for the strongest tone in ``avg_dB``.
+
+    Pure measurement -- no plotting, no I/O. Returns ``None`` when no tone
+    stands at least ``config.FCC_OVERLAY_MIN_SNR_DB`` above the noise-floor
+    median; the caller decides whether that means "draw nothing" (the spectrum
+    overlay) or "no_signal" (``/api/fcc_check``).
+
+    Two checks, both keyed to the detected carrier:
+
+    * **15.247(a)(1)** -- carrier separation must be >= 2/3 of the 20 dB
+      bandwidth, equivalently 20 dB BW <= 1.5 x ``config.CHANNEL_SPACING``.
+    * **15.247(d)** -- peaks outside the carrier's own skirt/channel must sit
+      at least ``config.SPUR_LIMIT_DBC`` dB below the carrier.
+
+    ``freqs_hz`` gives the absolute frequency of each bin (ascending, centred
+    on the LO) and ``bin_hz`` the bin width. Bin indices are returned next to
+    the physical values so the renderer can draw from exactly the numbers the
+    API reports -- this function is the single source of truth for both.
     """
     noise_dB = float(np.median(avg_dB))
     peak_idx = int(np.argmax(avg_dB))
     peak_dB = float(avg_dB[peak_idx])
     if peak_dB - noise_dB < config.FCC_OVERLAY_MIN_SNR_DB:
-        return  # no strong tone -> no overlay
-
-    peak_mhz = float(freqs_mhz[peak_idx])
+        return None  # no strong tone
 
     # 20 dB-down bandwidth: walk out from the peak until the trace drops 20 dB.
     thr_dB = peak_dB - 20.0
@@ -154,6 +185,80 @@ def _draw_fcc_tone_overlay(ax, freqs_mhz: np.ndarray, avg_dB: np.ndarray,
 
     spacing_hz = config.CHANNEL_SPACING
     spacing_ok = (2.0 / 3.0) * bw_hz <= spacing_hz
+
+    # -- Spurious emissions: peaks elsewhere in the band vs the -N dBc limit --
+    limit_dbc = config.SPUR_LIMIT_DBC
+    sep_bins = max(1, int(config.SPUR_MIN_SEP_KHZ * 1e3 / bin_hz))
+    cand, _ = find_peaks(
+        avg_dB,
+        height=noise_dB + config.SPUR_MIN_SNR_DB,
+        distance=sep_bins,
+        prominence=config.SPUR_MIN_PROMINENCE_DB,
+    )
+    # Exclude the carrier and its own skirt/channel from the spur list.
+    guard = max(peak_idx - li, ri - peak_idx, int(spacing_hz / 2 / bin_hz)) + 3
+
+    spurs: list[dict] = []
+    n_spur_fail = 0
+    worst_dbc = None
+    for p in (int(c) for c in cand):
+        if abs(p - peak_idx) <= guard:
+            continue
+        dbc = float(avg_dB[p]) - peak_dB  # negative: dB below carrier
+        if worst_dbc is None or dbc > worst_dbc:
+            worst_dbc = dbc
+        spur_ok = dbc <= -limit_dbc
+        if not spur_ok:
+            n_spur_fail += 1
+        spurs.append({
+            "idx": p,
+            "freq_hz": float(freqs_hz[p]),
+            "power_db": float(avg_dB[p]),
+            "dbc": dbc,
+            "pass": spur_ok,
+        })
+
+    return {
+        "carrier_idx": peak_idx,
+        "carrier_freq_hz": float(freqs_hz[peak_idx]),
+        "carrier_power_db": peak_dB,
+        "noise_floor_db": noise_dB,
+        "snr_db": peak_dB - noise_dB,
+        "bw_20db_hz": bw_hz,
+        "bw_lo_idx": li,
+        "bw_hi_idx": ri,
+        "bw_threshold_db": thr_dB,
+        "bw_limit_hz": 1.5 * spacing_hz,
+        "channel_spacing_hz": spacing_hz,
+        "spacing_ok": spacing_ok,
+        "spur_limit_dbc": limit_dbc,
+        "spur_limit_db": peak_dB - limit_dbc,
+        "spurs": spurs,
+        "n_spur_fail": n_spur_fail,
+        "worst_dbc": worst_dbc,
+        "spurs_ok": n_spur_fail == 0,
+        "overall_ok": spacing_ok and n_spur_fail == 0,
+    }
+
+
+def _draw_fcc_tone_overlay(ax, freqs_mhz: np.ndarray, fcc: dict) -> None:
+    """Draw the FCC 15.247 overlay from an :func:`evaluate_fcc_compliance` result.
+
+    Pure presentation: every number rendered here comes out of ``fcc``, so the
+    on-screen verdict and ``/api/fcc_check`` cannot drift apart.
+    """
+    peak_idx = fcc["carrier_idx"]
+    peak_mhz = float(freqs_mhz[peak_idx])
+    peak_dB = fcc["carrier_power_db"]
+    li, ri = fcc["bw_lo_idx"], fcc["bw_hi_idx"]
+    thr_dB = fcc["bw_threshold_db"]
+    bw_hz = fcc["bw_20db_hz"]
+    spacing_hz = fcc["channel_spacing_hz"]
+    spacing_ok = fcc["spacing_ok"]
+    limit_dbc = fcc["spur_limit_dbc"]
+    spurs = fcc["spurs"]
+    n_spur_fail = fcc["n_spur_fail"]
+    worst_dbc = fcc["worst_dbc"]
 
     pass_col, fail_col = "#4ade80", "#f87171"
     # Distinct magenta accent for the carrier geometry so the marker doesn't
@@ -174,44 +279,22 @@ def _draw_fcc_tone_overlay(ax, freqs_mhz: np.ndarray, avg_dB: np.ndarray,
         ax.plot([xf], [thr_dB], marker="|", markersize=10,
                 markeredgewidth=1.6, color=accent, zorder=6)
 
-    # -- Spurious emissions: peaks elsewhere in the band vs the -N dBc limit ---
-    limit_dbc = config.SPUR_LIMIT_DBC
-    limit_dB = peak_dB - limit_dbc
+    limit_dB = fcc["spur_limit_db"]
     ax.axhline(limit_dB, color="#cbd5e1", linewidth=1.0, linestyle="--",
                alpha=0.6, zorder=4)
     ax.text(freqs_mhz[-1], limit_dB, f"-{limit_dbc:.0f} dBc ", color="#cbd5e1",
             fontsize=7, va="bottom", ha="right", fontfamily="monospace",
             alpha=0.85, zorder=4)
 
-    sep_bins = max(1, int(config.SPUR_MIN_SEP_KHZ * 1e3 / bin_hz))
-    cand, _ = find_peaks(
-        avg_dB,
-        height=noise_dB + config.SPUR_MIN_SNR_DB,
-        distance=sep_bins,
-        prominence=config.SPUR_MIN_PROMINENCE_DB,
-    )
-    # Exclude the carrier and its own skirt/channel from the spur list.
-    guard = max(peak_idx - li, ri - peak_idx, int(spacing_hz / 2 / bin_hz)) + 3
-    spurs = [int(p) for p in cand if abs(int(p) - peak_idx) > guard]
+    for s in spurs:
+        scol = pass_col if s["pass"] else fail_col
+        ax.plot([freqs_mhz[s["idx"]]], [s["power_db"]], marker="v",
+                markersize=7, color=scol, zorder=6)
+        ax.text(freqs_mhz[s["idx"]], s["power_db"] + 1.5, f"{s['dbc']:.0f}",
+                color=scol, fontsize=7, va="bottom", ha="center",
+                fontfamily="monospace", zorder=6)
 
-    n_spur_fail = 0
-    worst_dbc = None
-    for p in spurs:
-        dbc = float(avg_dB[p]) - peak_dB  # negative: dB below carrier
-        if worst_dbc is None or dbc > worst_dbc:
-            worst_dbc = dbc
-        spur_ok = dbc <= -limit_dbc
-        if not spur_ok:
-            n_spur_fail += 1
-        scol = pass_col if spur_ok else fail_col
-        ax.plot([freqs_mhz[p]], [avg_dB[p]], marker="v", markersize=7,
-                color=scol, zorder=6)
-        ax.text(freqs_mhz[p], avg_dB[p] + 1.5, f"{dbc:.0f}", color=scol,
-                fontsize=7, va="bottom", ha="center", fontfamily="monospace",
-                zorder=6)
-
-    overall_ok = spacing_ok and n_spur_fail == 0
-    box_col = pass_col if overall_ok else fail_col
+    box_col = pass_col if fcc["overall_ok"] else fail_col
 
     def _row(label: str, value: str) -> str:
         return f"{label:<9}{value}"
@@ -253,25 +336,13 @@ def render_spectrum_image(chunks: list[np.ndarray], lo_freq_hz: float) -> bytes:
     # Average over a shorter window than the spectrogram so the trace reacts
     # faster to changes.
     chunks = chunks[-config.SPECTRUM_AVG_CHUNKS:]
-    Sxx_dB = np.concatenate(chunks, axis=1)
-    n_bins = Sxx_dB.shape[0]
-
-    # Average in the linear-power domain (mean of dB understates real power),
-    # and hold the max over the visible window as a peak trace.
-    lin = np.power(10.0, Sxx_dB / 10.0)
-    avg_dB = 10.0 * np.log10(np.mean(lin, axis=1) + 1e-12)
-    peak_dB = np.max(Sxx_dB, axis=1)
-
-    # compute_spec_chunk zeroes the DC bin (a -120 dB notch at the exact centre
-    # frequency) and LO leakage smears into a few neighbours; interpolate across
-    # +-SPEC_DC_NOTCH_BINS so the trace isn't a spike/notch at our frequency of
-    # interest. Cosmetic only -- these traces never feed the decoder.
-    _interpolate_dc(avg_dB, config.SPEC_DC_NOTCH_BINS)
-    _interpolate_dc(peak_dB, config.SPEC_DC_NOTCH_BINS)
+    n_bins = chunks[0].shape[0]
+    avg_dB, peak_dB = spectrum_traces(chunks)
 
     # Frequency axis: bins run -fs/2 .. +fs/2 (ascending), centred on the LO.
     fs = config.SAMPLE_RATE
-    freqs_mhz = (np.linspace(-fs / 2.0, fs / 2.0, n_bins) + lo_freq_hz) / 1e6
+    freqs_hz = np.linspace(-fs / 2.0, fs / 2.0, n_bins) + lo_freq_hz
+    freqs_mhz = freqs_hz / 1e6
     center_mhz = lo_freq_hz / 1e6
 
     dpi = 100
@@ -298,7 +369,9 @@ def render_spectrum_image(chunks: list[np.ndarray], lo_freq_hz: float) -> bytes:
     ax.set_xlim(freqs_mhz[0], freqs_mhz[-1])
 
     # FCC compliance overlay locked onto the strongest tone (skipped if none).
-    _draw_fcc_tone_overlay(ax, freqs_mhz, avg_dB, fs / n_bins)
+    fcc = evaluate_fcc_compliance(freqs_hz, avg_dB, fs / n_bins)
+    if fcc is not None:
+        _draw_fcc_tone_overlay(ax, freqs_mhz, fcc)
 
     ax.text(center_mhz, y_hi, f" {center_mhz:.5f} MHz", color="#3399ff",
             fontsize=8, fontweight="bold", va="top", ha="left",
