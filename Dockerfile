@@ -80,10 +80,12 @@ COPY decoder-src* /tmp/decoder-src/
 # beyond 1.x or gnuradio fails to import. --ignore-installed is needed because some system
 # distutils packages (blinker, etc.) can't be pip-uninstalled cleanly.
 RUN python3 -m pip install --upgrade pip setuptools wheel
-# NOTE: a non-local build pulls hubble-satnet-decoder from PyPI. Until 1.2.0 (which adds
-# analyze_packet) is published, the app imports will fail at startup on a non-local build --
-# use --build-arg USE_LOCAL_DECODER=1 in the meantime.
-RUN python3 -m pip install --ignore-installed -e . "numpy>=1.26,<2"
+
+# DECODER_CACHE_BUST is set to a fresh value by CI so this layer always re-resolves
+# hubble-satnet-decoder against PyPI instead of reusing a stale cached layer.
+ARG DECODER_CACHE_BUST=0
+RUN echo "decoder cache bust: ${DECODER_CACHE_BUST}" && \
+    python3 -m pip install --ignore-installed -e . "numpy>=1.26,<2"
 
 # For a local decoder build, override the PyPI decoder that `-e .` just pulled with the copied
 # source (--no-deps, so only the decoder package is replaced) so the local version wins.
